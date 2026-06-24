@@ -298,6 +298,48 @@ class ComplexSpeechDataset(Dataset):
 
 
 # ====================================================================
+# 模块级 collate_fn（必须放在模块顶层，供 Windows 多进程 pickle 使用）
+# ====================================================================
+
+def _collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """模块级批次组装函数：将不等长的音频 padding 成对齐的张量，并记录真实长度。
+
+    必须定义为模块顶层函数（而非嵌套函数），否则 Windows 下
+    multiprocessing 的 pickle 序列化会失败并抛出:
+        ``AttributeError: Can't pickle local object``
+    """
+    from torch.nn.utils.rnn import pad_sequence
+
+    # 提取波形，注意要把 [1, T] 挤压成 [T] 才能用 pad_sequence
+    batch_enroll = [item["enroll_wav"].squeeze(0) for item in batch]
+    batch_mixed = [item["mixed_wav"].squeeze(0) for item in batch]
+
+    # 记录原始长度
+    enroll_lengths = torch.tensor([wav.shape[0] for wav in batch_enroll], dtype=torch.long)
+    mixed_lengths = torch.tensor([wav.shape[0] for wav in batch_mixed], dtype=torch.long)
+
+    # Padding 操作，batch_first=True 保证输出 shape 为 [B, T]
+    enroll_padded = pad_sequence(batch_enroll, batch_first=True)
+    mixed_padded = pad_sequence(batch_mixed, batch_first=True)
+
+    # 为了兼容后续的模型输入，再把通道维度加回来，变成 [B, 1, T]
+    enroll_padded = enroll_padded.unsqueeze(1)
+    mixed_padded = mixed_padded.unsqueeze(1)
+
+    batch_labels = [item["text_label"] for item in batch]
+    batch_targets = torch.tensor([item["is_target"] for item in batch], dtype=torch.long)
+
+    return {
+        "enroll_wavs": enroll_padded,         # [B, 1, T_enroll]
+        "enroll_lengths": enroll_lengths,     # [B]
+        "mixed_wavs": mixed_padded,           # [B, 1, T_mixed]
+        "mixed_lengths": mixed_lengths,       # [B]
+        "text_labels": batch_labels,          # List[str]
+        "is_targets": batch_targets,          # [B]
+    }
+
+
+# ====================================================================
 # 模块级便捷函数
 # ====================================================================
 
@@ -322,7 +364,7 @@ def create_dataloader_from_config(
     shuffle : bool, optional
         是否打乱数据，默认 True。
     num_workers : int, optional
-        数据加载子进程数，默认 4。
+        数据加载子进程数，默认 4。Windows 下建议设为 0（主进程）避免 pickle 问题。
     sample_rate : int, optional
         目标采样率，默认 16000。
 
@@ -346,46 +388,12 @@ def create_dataloader_from_config(
         stats["total"],
     )
 
-    # collate_fn: 将不等长的音频 padding 成对齐的张量，并记录真实长度，
-    # 这样模型才知道哪里是有效语音，哪里是补上去的静音（padding）。
-    def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """进阶批次组装：将不等长的音频 padding 成对齐的张量，并记录真实长度。"""
-        from torch.nn.utils.rnn import pad_sequence
-
-        # 提取波形，注意要把 [1, T] 挤压成 [T] 才能用 pad_sequence
-        batch_enroll = [item["enroll_wav"].squeeze(0) for item in batch]
-        batch_mixed = [item["mixed_wav"].squeeze(0) for item in batch]
-
-        # 记录原始长度
-        enroll_lengths = torch.tensor([wav.shape[0] for wav in batch_enroll], dtype=torch.long)
-        mixed_lengths = torch.tensor([wav.shape[0] for wav in batch_mixed], dtype=torch.long)
-
-        # Padding 操作，batch_first=True 保证输出 shape 为 [B, T]
-        enroll_padded = pad_sequence(batch_enroll, batch_first=True)
-        mixed_padded = pad_sequence(batch_mixed, batch_first=True)
-
-        # 为了兼容后续的模型输入，再把通道维度加回来，变成 [B, 1, T]
-        enroll_padded = enroll_padded.unsqueeze(1)
-        mixed_padded = mixed_padded.unsqueeze(1)
-
-        batch_labels = [item["text_label"] for item in batch]
-        batch_targets = torch.tensor([item["is_target"] for item in batch], dtype=torch.long)
-
-        return {
-            "enroll_wavs": enroll_padded,         # [B, 1, T_enroll]
-            "enroll_lengths": enroll_lengths,     # [B]
-            "mixed_wavs": mixed_padded,           # [B, 1, T_mixed]
-            "mixed_lengths": mixed_lengths,       # [B]
-            "text_labels": batch_labels,          # List[str]
-            "is_targets": batch_targets,          # [B]
-        }
-
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=_collate_fn,
         pin_memory=True,
     )
 
