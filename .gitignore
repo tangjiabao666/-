@@ -1,33 +1,30 @@
-# Python 缓存
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
 
-# 模型权重 / 断点 (体积大，不适合 git)
-# 但保留 .gitkeep 文件以维持目录结构
+# 模型权重
 *.pt
 *.pth
 *.ckpt
-checkpoints/*
-!checkpoints/.gitkeep
 
-# 音频数据 (200MB+，不适合 git)
+# 音频文件
 *.wav
 *.mp3
 *.flac
 *.ogg
-datasetA/
-TSE_ASR_Project/data/raw/
-TSE_ASR_Project/data/processed/
 
-# 无关文档
+# 大文件
+*.zip
+*.tar.gz
 *.docx
 *.pdf
+datasetA/
 
 # IDE
 .vscode/
 .idea/
 
-# 系统文件
+# 系统
 Thumbs.db
 .DS_Store
