@@ -5,6 +5,10 @@
     "competition_train_split": "data/splits/train.jsonl",
     "competition_dev_split": "data/splits/dev.jsonl",
     "external_root": "/home/tzb/tjb/external_data/thchs30",
+    "librispeech_root": "/home/tzb/tjb/external_data/librispeech",
+    "librispeech_url": "https://www.openslr.org/resources/12/dev-clean.tar.gz",
+    "librispeech_synthetic_train_manifest": "data/external/librispeech_synth_train.jsonl",
+    "librispeech_synthetic_dev_manifest": "data/external/librispeech_synth_dev.jsonl",
     "thchs30_archive": "/home/tzb/tjb/external_data/thchs30/data_thchs30.tgz",
     "thchs30_url": "https://openslr.magicdatatech.com/resources/18/data_thchs30.tgz",
     "synthetic_train_manifest": "data/external/thchs30_synth_train.jsonl",
@@ -13,6 +17,7 @@
   "checkpoints": {
     "asr_base": "checkpoints_asr_mixed/latest.pt",
     "best_joint": "checkpoints_reject_calibrated/latest.pt",
+    "external_quick_best": "checkpoints_librispeech_synth_reject_cal/latest.pt",
     "synthetic_tse": "checkpoints_tse_synthetic/latest.pt"
   },
   "model": {
@@ -35,6 +40,6 @@
   },
   "evaluation": {
     "device": "cuda",
-    "reject_threshold": 0.65
+    "reject_threshold": 0.60
   }
 }
