@@ -319,6 +319,10 @@ class LightASRBackend(nn.Module):
             # 4 倍降采样: ((T - 1) // 2 - 1) // 2 + 1 ≈ ceil(T / 4)
             enc_lengths = torch.ceil(enc_lengths.float() / 4.0).long()
             enc_lengths = enc_lengths.clamp(min=1, max=feat.shape[1])
+            max_valid_len = int(enc_lengths.max().item())
+            if max_valid_len < feat.shape[1]:
+                feat = feat[:, :max_valid_len, :]
+            enc_lengths = enc_lengths.clamp(min=1, max=feat.shape[1])
         else:
             enc_lengths = None
         conformer_out, output_lengths = self.conformer(feat, enc_lengths)
