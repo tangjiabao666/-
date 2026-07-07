@@ -60,11 +60,20 @@ def build_model(vocab_size: int, device: torch.device) -> JointTSEASR:
     return model.to(device)
 
 
-def set_stage_trainable(model: JointTSEASR, train_speaker: bool) -> None:
+def set_stage_trainable(
+    model: JointTSEASR,
+    train_speaker: bool,
+    train_tse: bool,
+    train_fusion: bool,
+) -> None:
     for param in model.parameters():
         param.requires_grad = False
-    for param in model.tse_extractor.parameters():
-        param.requires_grad = True
+    if train_tse:
+        for param in model.tse_extractor.parameters():
+            param.requires_grad = True
+    if train_fusion:
+        for param in model.fusion_gate.parameters():
+            param.requires_grad = True
     for param in model.rejection_head.parameters():
         param.requires_grad = True
     if train_speaker:
@@ -127,11 +136,18 @@ def train_one_epoch(
     asr_weight: float,
     reject_weight: float,
     signal_weight: float,
+    neg_class_weight: float,
+    pos_class_weight: float,
 ) -> Dict[str, float]:
     model.train()
     model.asr_backend.eval()
     ctc_loss = torch.nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True, reduction="none")
-    ce_loss = torch.nn.CrossEntropyLoss()
+    ce_weights = torch.tensor(
+        [neg_class_weight, pos_class_weight],
+        dtype=torch.float32,
+        device=device,
+    )
+    ce_loss = torch.nn.CrossEntropyLoss(weight=ce_weights)
     sums = {"total": 0.0, "asr": 0.0, "reject": 0.0, "signal": 0.0}
     steps = 0
 
@@ -234,10 +250,19 @@ def main(args: argparse.Namespace) -> None:
     )
 
     model = build_model(tokenizer.vocab_size, device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
     logger.info("已加载模型权重: %s", args.resume)
+    if load_result.missing_keys:
+        logger.info("新初始化参数: %s", ", ".join(load_result.missing_keys))
+    if load_result.unexpected_keys:
+        logger.info("checkpoint 中未使用参数: %s", ", ".join(load_result.unexpected_keys))
 
-    set_stage_trainable(model, train_speaker=not args.freeze_speaker)
+    set_stage_trainable(
+        model,
+        train_speaker=not args.freeze_speaker,
+        train_tse=not args.freeze_tse,
+        train_fusion=not args.freeze_fusion,
+    )
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info("冻结 ASR backend，可训练参数量: %s", f"{trainable:,}")
 
@@ -273,6 +298,8 @@ def main(args: argparse.Namespace) -> None:
             asr_weight=args.asr_weight,
             reject_weight=args.reject_weight,
             signal_weight=args.signal_weight,
+            neg_class_weight=args.neg_class_weight,
+            pos_class_weight=args.pos_class_weight,
         )
         logger.info(
             "Epoch %d 平均损失: Total=%.4f | ASR=%.4f | Rej=%.4f | Sig=%.5f",
@@ -315,7 +342,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asr_weight", type=float, default=1.0)
     parser.add_argument("--reject_weight", type=float, default=0.5)
     parser.add_argument("--signal_weight", type=float, default=0.02)
+    parser.add_argument("--neg_class_weight", type=float, default=1.0)
+    parser.add_argument("--pos_class_weight", type=float, default=1.0)
     parser.add_argument("--freeze_speaker", action="store_true")
+    parser.add_argument("--freeze_tse", action="store_true")
+    parser.add_argument("--freeze_fusion", action="store_true")
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)

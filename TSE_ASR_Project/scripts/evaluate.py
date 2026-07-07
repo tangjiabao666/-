@@ -110,7 +110,11 @@ def evaluate(args: argparse.Namespace) -> None:
     tokenizer = restore_tokenizer(checkpoint)
 
     model = build_model(tokenizer.vocab_size, device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_result = model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+    if load_result.missing_keys:
+        logger.info("Newly initialized parameters: %s", ", ".join(load_result.missing_keys))
+    if load_result.unexpected_keys:
+        logger.info("Unused checkpoint parameters: %s", ", ".join(load_result.unexpected_keys))
     model.eval()
 
     dataloader = create_dataloader_from_config(
