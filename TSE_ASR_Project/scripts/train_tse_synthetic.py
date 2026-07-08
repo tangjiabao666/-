@@ -83,8 +83,26 @@ def fit_length(wav: torch.Tensor, length: int, rng: random.Random) -> torch.Tens
     return wav.repeat(1, reps)[..., :length]
 
 
+def shift_right(wav: torch.Tensor, max_shift: int, rng: random.Random) -> torch.Tensor:
+    if max_shift <= 0:
+        return wav
+    shift = rng.randint(0, max_shift)
+    if shift <= 0:
+        return wav
+    return F.pad(wav[..., :-shift], (shift, 0))
+
+
 def rms(wav: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(torch.mean(wav ** 2) + 1e-8)
+
+
+def match_snr(reference: torch.Tensor, noise: torch.Tensor, snr_db: float) -> torch.Tensor:
+    return noise * (rms(reference) / (rms(noise) * (10.0 ** (snr_db / 20.0)) + 1e-8))
+
+
+def random_gain(wav: torch.Tensor, rng: random.Random, min_db: float, max_db: float) -> torch.Tensor:
+    gain_db = rng.uniform(min_db, max_db)
+    return wav * (10.0 ** (gain_db / 20.0))
 
 
 class SyntheticTSEDataset(Dataset):
@@ -95,6 +113,13 @@ class SyntheticTSEDataset(Dataset):
         snr_min_db: float,
         snr_max_db: float,
         max_seconds: float,
+        enroll_max_seconds: float,
+        noise_prob: float,
+        noise_snr_min_db: float,
+        noise_snr_max_db: float,
+        max_shift_ms: float,
+        gain_min_db: float,
+        gain_max_db: float,
         seed: int,
     ) -> None:
         self.rows: List[Dict[str, object]] = []
@@ -109,6 +134,13 @@ class SyntheticTSEDataset(Dataset):
         self.snr_min_db = snr_min_db
         self.snr_max_db = snr_max_db
         self.max_len = int(max_seconds * sample_rate) if max_seconds > 0 else None
+        self.enroll_max_len = int(enroll_max_seconds * sample_rate) if enroll_max_seconds > 0 else None
+        self.noise_prob = noise_prob
+        self.noise_snr_min_db = noise_snr_min_db
+        self.noise_snr_max_db = noise_snr_max_db
+        self.max_shift = int(max_shift_ms * sample_rate / 1000.0)
+        self.gain_min_db = gain_min_db
+        self.gain_max_db = gain_max_db
         self.seed = seed
 
     def __len__(self) -> int:
@@ -121,20 +153,29 @@ class SyntheticTSEDataset(Dataset):
         target = load_audio(str(row["target_wav"]), self.sample_rate)
         interferer = load_audio(str(row["interferer_wav"]), self.sample_rate)
 
+        if self.enroll_max_len is not None and enroll.shape[-1] > self.enroll_max_len:
+            enroll = fit_length(enroll, self.enroll_max_len, rng)
         if self.max_len is not None and target.shape[-1] > self.max_len:
             target = fit_length(target, self.max_len, rng)
         length = target.shape[-1]
         interferer = fit_length(interferer, length, rng)
+        target = random_gain(target, rng, self.gain_min_db, self.gain_max_db)
+        interferer = random_gain(interferer, rng, self.gain_min_db, self.gain_max_db)
+        interferer = shift_right(interferer, self.max_shift, rng)
 
         is_target = int(row["is_target"])
         snr_db = rng.uniform(self.snr_min_db, self.snr_max_db)
         if is_target:
             clean = target
-            scale = rms(clean) / (rms(interferer) * (10.0 ** (snr_db / 20.0)) + 1e-8)
-            mixed = clean + interferer * scale
+            mixed = clean + match_snr(clean, interferer, snr_db)
         else:
             clean = torch.zeros_like(target)
-            mixed = target
+            mixed = target + match_snr(target, interferer, snr_db)
+
+        if self.noise_prob > 0 and rng.random() < self.noise_prob:
+            noise = torch.randn_like(mixed)
+            noise_snr = rng.uniform(self.noise_snr_min_db, self.noise_snr_max_db)
+            mixed = mixed + match_snr(mixed, noise, noise_snr)
 
         peak = mixed.abs().max().clamp_min(1.0)
         mixed = mixed / peak
@@ -319,6 +360,13 @@ def main(args: argparse.Namespace) -> None:
         snr_min_db=args.snr_min_db,
         snr_max_db=args.snr_max_db,
         max_seconds=args.max_seconds,
+        enroll_max_seconds=args.enroll_max_seconds,
+        noise_prob=args.noise_prob,
+        noise_snr_min_db=args.noise_snr_min_db,
+        noise_snr_max_db=args.noise_snr_max_db,
+        max_shift_ms=args.max_shift_ms,
+        gain_min_db=args.gain_min_db,
+        gain_max_db=args.gain_max_db,
         seed=args.seed,
     )
     dataloader = DataLoader(
@@ -387,6 +435,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--snr_min_db", type=float, default=-3.0)
     parser.add_argument("--snr_max_db", type=float, default=6.0)
     parser.add_argument("--max_seconds", type=float, default=6.0)
+    parser.add_argument("--enroll_max_seconds", type=float, default=4.0)
+    parser.add_argument("--noise_prob", type=float, default=0.2)
+    parser.add_argument("--noise_snr_min_db", type=float, default=12.0)
+    parser.add_argument("--noise_snr_max_db", type=float, default=24.0)
+    parser.add_argument("--max_shift_ms", type=float, default=120.0)
+    parser.add_argument("--gain_min_db", type=float, default=-4.0)
+    parser.add_argument("--gain_max_db", type=float, default=4.0)
     parser.add_argument("--tse_weight", type=float, default=1.0)
     parser.add_argument("--fused_weight", type=float, default=0.5)
     parser.add_argument("--reject_weight", type=float, default=0.5)
