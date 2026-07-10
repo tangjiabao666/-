@@ -1,0 +1,45 @@
+{
+  "data": {
+    "competition_jsonl": "data/raw/test_set_a/labels.jsonl",
+    "competition_audio_dir": "data/raw/test_set_a",
+    "competition_train_split": "data/splits/train.jsonl",
+    "competition_dev_split": "data/splits/dev.jsonl",
+    "external_root": "/home/tzb/tjb/external_data/thchs30",
+    "librispeech_root": "/home/tzb/tjb/external_data/librispeech",
+    "librispeech_url": "https://www.openslr.org/resources/12/dev-clean.tar.gz",
+    "librispeech_synthetic_train_manifest": "data/external/librispeech_synth_train.jsonl",
+    "librispeech_synthetic_dev_manifest": "data/external/librispeech_synth_dev.jsonl",
+    "thchs30_archive": "/home/tzb/tjb/external_data/thchs30/data_thchs30.tgz",
+    "thchs30_url": "https://openslr.magicdatatech.com/resources/18/data_thchs30.tgz",
+    "synthetic_train_manifest": "data/external/thchs30_synth_train.jsonl",
+    "synthetic_dev_manifest": "data/external/thchs30_synth_dev.jsonl"
+  },
+  "checkpoints": {
+    "asr_base": "checkpoints_asr_mixed/latest.pt",
+    "best_joint": "checkpoints_reject_calibrated/latest.pt",
+    "external_quick_best": "checkpoints_librispeech_synth_reject_cal/latest.pt",
+    "synthetic_tse": "checkpoints_tse_synthetic/latest.pt"
+  },
+  "model": {
+    "sample_rate": 16000,
+    "speaker_embedding_dim": 256,
+    "asr_conformer_dim": 256,
+    "asr_conformer_layers": 4
+  },
+  "training": {
+    "batch_size": 8,
+    "num_workers": 0,
+    "synthetic_epochs": 8,
+    "synthetic_lr": 0.00003,
+    "snr_min_db": -3.0,
+    "snr_max_db": 6.0,
+    "positive_ratio": 0.75,
+    "reject_weight": 0.5,
+    "tse_weight": 1.0,
+    "fused_weight": 0.5
+  },
+  "evaluation": {
+    "device": "cuda",
+    "reject_threshold": 0.60
+  }
+}

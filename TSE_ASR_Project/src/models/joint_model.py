@@ -319,6 +319,10 @@ class LightASRBackend(nn.Module):
             # 4 倍降采样: ((T - 1) // 2 - 1) // 2 + 1 ≈ ceil(T / 4)
             enc_lengths = torch.ceil(enc_lengths.float() / 4.0).long()
             enc_lengths = enc_lengths.clamp(min=1, max=feat.shape[1])
+            max_valid_len = int(enc_lengths.max().item())
+            if max_valid_len < feat.shape[1]:
+                feat = feat[:, :max_valid_len, :]
+            enc_lengths = enc_lengths.clamp(min=1, max=feat.shape[1])
         else:
             enc_lengths = None
         conformer_out, output_lengths = self.conformer(feat, enc_lengths)
@@ -333,6 +337,56 @@ class LightASRBackend(nn.Module):
 # ====================================================================
 # 拒识分类头 (Rejection Head)
 # ====================================================================
+
+class WaveformFusionGate(nn.Module):
+    """Blend TSE output with the original mixture to avoid over-suppression."""
+
+    def __init__(self, emb_dim: int = 256, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(emb_dim + 4, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1),
+        )
+        for module in self.net:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                nn.init.constant_(module.bias, 0)
+        # Start close to the strong mixed-audio baseline, then learn when to trust TSE.
+        nn.init.constant_(self.net[-1].bias, -2.0)
+
+    def forward(
+        self,
+        mixed_wavs: torch.Tensor,
+        tse_wavs: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        mixed_abs = self._masked_abs_mean(mixed_wavs, lengths)
+        tse_abs = self._masked_abs_mean(tse_wavs, lengths)
+        diff_abs = self._masked_abs_mean(mixed_wavs - tse_wavs, lengths)
+        rel_diff = diff_abs / (mixed_abs + 1e-6)
+        stats = torch.cat([mixed_abs, tse_abs, diff_abs, rel_diff], dim=1)
+        gate = torch.sigmoid(self.net(torch.cat([speaker_embedding, stats], dim=1)))
+        gate = gate.view(-1, 1, 1)
+        fused_wavs = gate * tse_wavs + (1.0 - gate) * mixed_wavs
+        return fused_wavs, gate
+
+    @staticmethod
+    def _masked_abs_mean(
+        wavs: torch.Tensor,
+        lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if lengths is None:
+            return wavs.abs().mean(dim=(1, 2)).unsqueeze(1)
+        max_len = wavs.shape[-1]
+        mask = torch.arange(max_len, device=wavs.device).view(1, 1, -1)
+        mask = mask < lengths.to(wavs.device).view(-1, 1, 1)
+        numerator = (wavs.abs() * mask).sum(dim=(1, 2), keepdim=False)
+        denominator = lengths.to(wavs.device, wavs.dtype).clamp_min(1.0)
+        return (numerator / denominator).unsqueeze(1)
+
 
 class RejectionHead(nn.Module):
     """拒识分类头——判断提纯音频中是否包含目标说话人。
@@ -373,11 +427,19 @@ class RejectionHead(nn.Module):
             n_mels=n_mels,
             power=2.0,
         )
+        self.n_fft = 512
+        self.hop_length = 160
 
         # ---------- 分类器 ----------
         # 输入: 声学特征池化向量 [B, n_mels] + 声纹嵌入 [B, emb_dim]
         #      → [B, n_mels + emb_dim]
         # 输出: [B, 2]（二分类 logits）
+        self.contrast_proj = nn.Sequential(
+            nn.Linear(n_mels * 3, n_mels),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(n_mels, n_mels),
+        )
         self.classifier = nn.Sequential(
             nn.Linear(n_mels + emb_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -396,11 +458,21 @@ class RejectionHead(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
+        for module in self.contrast_proj:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        nn.init.constant_(self.contrast_proj[-1].weight, 0)
+        nn.init.constant_(self.contrast_proj[-1].bias, 0)
 
     def forward(
         self,
         clean_wavs: torch.Tensor,
         speaker_embedding: torch.Tensor,
+        mixed_wavs: Optional[torch.Tensor] = None,
+        extracted_wavs: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """前向传播：计算拒识二分类 logits。
 
@@ -429,7 +501,17 @@ class RejectionHead(nn.Module):
 
         # ---------- Step 2: 全局时间池化 ----------
         # 对整个音频的时间维度做平均，得到一个固定长度的声学表征
-        acoustic_feat = mel.mean(dim=2)   # [B, n_mels]
+        acoustic_feat = self._masked_mel_mean(mel, lengths)
+
+        if mixed_wavs is not None:
+            mixed_feat = self._pool_audio(mixed_wavs, lengths)
+            diff_feat = (mixed_feat - acoustic_feat).abs()
+            if extracted_wavs is not None:
+                extracted_feat = self._pool_audio(extracted_wavs, lengths)
+            else:
+                extracted_feat = acoustic_feat
+            contrast_feat = torch.cat([mixed_feat, extracted_feat, diff_feat], dim=1)
+            acoustic_feat = acoustic_feat + self.contrast_proj(contrast_feat)
 
         # ---------- Step 3: 拼接声学特征与声纹嵌入 ----------
         combined = torch.cat([acoustic_feat, speaker_embedding], dim=1)
@@ -439,6 +521,41 @@ class RejectionHead(nn.Module):
         logits = self.classifier(combined)  # [B, 2]
 
         return logits
+
+    def _pool_audio(
+        self,
+        wavs: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if wavs.dim() == 3:
+            wav = wavs.squeeze(1)
+        else:
+            wav = wavs
+        mel = self.mel_spec(wav)
+        mel = torch.log(mel + 1e-6)
+        return self._masked_mel_mean(mel, lengths)
+
+    def _masked_mel_mean(
+        self,
+        mel: torch.Tensor,
+        lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if lengths is None:
+            return mel.mean(dim=2)
+
+        # Only pool frames whose full STFT window lies inside real audio.
+        # This excludes both waveform padding and center-padding boundary frames.
+        frame_lengths = torch.div(
+            lengths.to(mel.device) - self.n_fft // 2,
+            self.hop_length,
+            rounding_mode="floor",
+        ) + 1
+        frame_lengths = frame_lengths.clamp(min=1, max=mel.shape[-1])
+        mask = torch.arange(mel.shape[-1], device=mel.device).view(1, 1, -1)
+        mask = mask < frame_lengths.view(-1, 1, 1)
+        numerator = (mel * mask).sum(dim=2)
+        denominator = frame_lengths.to(mel.dtype).unsqueeze(1)
+        return numerator / denominator
 
 
 # ====================================================================
@@ -519,6 +636,11 @@ class JointTSEASR(nn.Module):
             blocks_per_repeat=5,
         )
 
+        self.fusion_gate = WaveformFusionGate(
+            emb_dim=spk_emb_dim,
+            hidden_dim=128,
+        )
+
         # ---------- 3. 拒识分类头 ----------
         self.rejection_head = RejectionHead(
             n_mels=n_mels,
@@ -578,16 +700,23 @@ class JointTSEASR(nn.Module):
         # Stage 2: Target Speaker Extraction
         # ==========================================================
         # 利用声纹嵌入从混合音频中提取仅含目标说话人的干净语音
-        clean_wavs = self.tse_extractor(
+        tse_wavs = self.tse_extractor(
             mixed_wavs, speaker_embedding
         )  # [B, 1, T_mix]
+        clean_wavs, fusion_gate = self.fusion_gate(
+            mixed_wavs, tse_wavs, speaker_embedding, mixed_lengths
+        )
 
         # ==========================================================
         # Stage 3: Rejection Classification
         # ==========================================================
         # 判断提纯音频是否真的包含目标说话人 (pos/neg 二分类)
         reject_logits = self.rejection_head(
-            clean_wavs, speaker_embedding
+            clean_wavs,
+            speaker_embedding,
+            mixed_wavs=mixed_wavs,
+            extracted_wavs=tse_wavs,
+            lengths=mixed_lengths,
         )  # [B, 2]
 
         # ==========================================================
@@ -600,6 +729,8 @@ class JointTSEASR(nn.Module):
 
         return {
             "clean_wavs": clean_wavs,         # [B, 1, T_mix]
+            "tse_wavs": tse_wavs,             # [B, 1, T_mix]
+            "fusion_gate": fusion_gate,       # [B, 1, 1]
             "reject_logits": reject_logits,   # [B, 2]
             "asr_logits": asr_logits,         # [B, T_enc, vocab_size]
             "asr_lengths": asr_lengths,       # [B]
@@ -619,6 +750,7 @@ class JointTSEASR(nn.Module):
         return {
             "speaker_encoder": count(self.speaker_encoder),
             "tse_extractor": count(self.tse_extractor),
+            "fusion_gate": count(self.fusion_gate),
             "rejection_head": count(self.rejection_head),
             "asr_backend": count(self.asr_backend),
         }
