@@ -5,6 +5,7 @@
 import argparse
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -106,6 +107,7 @@ def save_checkpoint(
     scaler: torch.cuda.amp.GradScaler,
     tokenizer: SimpleCharTokenizer,
     avg_losses: Dict[str, float],
+    training_args: Dict[str, object],
 ) -> None:
     torch.save(
         {
@@ -117,6 +119,7 @@ def save_checkpoint(
             "tokenizer_char_to_id": tokenizer.char_to_id,
             "avg_losses": avg_losses,
             "training_mode": "tse_stage_frozen_asr",
+            "training_args": training_args,
         },
         path,
     )
@@ -140,6 +143,14 @@ def train_one_epoch(
     pos_class_weight: float,
 ) -> Dict[str, float]:
     model.train()
+    for module in [
+        model.speaker_encoder,
+        model.tse_extractor,
+        model.fusion_gate,
+        model.asr_backend,
+    ]:
+        if not any(param.requires_grad for param in module.parameters()):
+            module.eval()
     model.asr_backend.eval()
     ctc_loss = torch.nn.CTCLoss(blank=tokenizer.blank_id, zero_infinity=True, reduction="none")
     ce_weights = torch.tensor(
@@ -228,6 +239,10 @@ def train_one_epoch(
 
 
 def main(args: argparse.Namespace) -> None:
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("使用设备: %s", device)
     if device.type == "cuda":
@@ -317,6 +332,7 @@ def main(args: argparse.Namespace) -> None:
             scaler,
             tokenizer,
             avg_losses,
+            vars(args),
         )
         save_checkpoint(
             checkpoint_dir / "latest.pt",
@@ -326,6 +342,7 @@ def main(args: argparse.Namespace) -> None:
             scaler,
             tokenizer,
             avg_losses,
+            vars(args),
         )
 
 
@@ -350,6 +367,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--max_grad_norm", type=float, default=5.0)
+    parser.add_argument("--seed", type=int, default=20260710)
     return parser.parse_args()
 
 

@@ -361,16 +361,31 @@ class WaveformFusionGate(nn.Module):
         mixed_wavs: torch.Tensor,
         tse_wavs: torch.Tensor,
         speaker_embedding: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        mixed_abs = mixed_wavs.abs().mean(dim=(1, 2)).unsqueeze(1)
-        tse_abs = tse_wavs.abs().mean(dim=(1, 2)).unsqueeze(1)
-        diff_abs = (mixed_wavs - tse_wavs).abs().mean(dim=(1, 2)).unsqueeze(1)
+        mixed_abs = self._masked_abs_mean(mixed_wavs, lengths)
+        tse_abs = self._masked_abs_mean(tse_wavs, lengths)
+        diff_abs = self._masked_abs_mean(mixed_wavs - tse_wavs, lengths)
         rel_diff = diff_abs / (mixed_abs + 1e-6)
         stats = torch.cat([mixed_abs, tse_abs, diff_abs, rel_diff], dim=1)
         gate = torch.sigmoid(self.net(torch.cat([speaker_embedding, stats], dim=1)))
         gate = gate.view(-1, 1, 1)
         fused_wavs = gate * tse_wavs + (1.0 - gate) * mixed_wavs
         return fused_wavs, gate
+
+    @staticmethod
+    def _masked_abs_mean(
+        wavs: torch.Tensor,
+        lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if lengths is None:
+            return wavs.abs().mean(dim=(1, 2)).unsqueeze(1)
+        max_len = wavs.shape[-1]
+        mask = torch.arange(max_len, device=wavs.device).view(1, 1, -1)
+        mask = mask < lengths.to(wavs.device).view(-1, 1, 1)
+        numerator = (wavs.abs() * mask).sum(dim=(1, 2), keepdim=False)
+        denominator = lengths.to(wavs.device, wavs.dtype).clamp_min(1.0)
+        return (numerator / denominator).unsqueeze(1)
 
 
 class RejectionHead(nn.Module):
@@ -412,6 +427,8 @@ class RejectionHead(nn.Module):
             n_mels=n_mels,
             power=2.0,
         )
+        self.n_fft = 512
+        self.hop_length = 160
 
         # ---------- 分类器 ----------
         # 输入: 声学特征池化向量 [B, n_mels] + 声纹嵌入 [B, emb_dim]
@@ -455,6 +472,7 @@ class RejectionHead(nn.Module):
         speaker_embedding: torch.Tensor,
         mixed_wavs: Optional[torch.Tensor] = None,
         extracted_wavs: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """前向传播：计算拒识二分类 logits。
 
@@ -483,13 +501,13 @@ class RejectionHead(nn.Module):
 
         # ---------- Step 2: 全局时间池化 ----------
         # 对整个音频的时间维度做平均，得到一个固定长度的声学表征
-        acoustic_feat = mel.mean(dim=2)   # [B, n_mels]
+        acoustic_feat = self._masked_mel_mean(mel, lengths)
 
         if mixed_wavs is not None:
-            mixed_feat = self._pool_audio(mixed_wavs)
+            mixed_feat = self._pool_audio(mixed_wavs, lengths)
             diff_feat = (mixed_feat - acoustic_feat).abs()
             if extracted_wavs is not None:
-                extracted_feat = self._pool_audio(extracted_wavs)
+                extracted_feat = self._pool_audio(extracted_wavs, lengths)
             else:
                 extracted_feat = acoustic_feat
             contrast_feat = torch.cat([mixed_feat, extracted_feat, diff_feat], dim=1)
@@ -504,14 +522,40 @@ class RejectionHead(nn.Module):
 
         return logits
 
-    def _pool_audio(self, wavs: torch.Tensor) -> torch.Tensor:
+    def _pool_audio(
+        self,
+        wavs: torch.Tensor,
+        lengths: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         if wavs.dim() == 3:
             wav = wavs.squeeze(1)
         else:
             wav = wavs
         mel = self.mel_spec(wav)
         mel = torch.log(mel + 1e-6)
-        return mel.mean(dim=2)
+        return self._masked_mel_mean(mel, lengths)
+
+    def _masked_mel_mean(
+        self,
+        mel: torch.Tensor,
+        lengths: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if lengths is None:
+            return mel.mean(dim=2)
+
+        # Only pool frames whose full STFT window lies inside real audio.
+        # This excludes both waveform padding and center-padding boundary frames.
+        frame_lengths = torch.div(
+            lengths.to(mel.device) - self.n_fft // 2,
+            self.hop_length,
+            rounding_mode="floor",
+        ) + 1
+        frame_lengths = frame_lengths.clamp(min=1, max=mel.shape[-1])
+        mask = torch.arange(mel.shape[-1], device=mel.device).view(1, 1, -1)
+        mask = mask < frame_lengths.view(-1, 1, 1)
+        numerator = (mel * mask).sum(dim=2)
+        denominator = frame_lengths.to(mel.dtype).unsqueeze(1)
+        return numerator / denominator
 
 
 # ====================================================================
@@ -660,7 +704,7 @@ class JointTSEASR(nn.Module):
             mixed_wavs, speaker_embedding
         )  # [B, 1, T_mix]
         clean_wavs, fusion_gate = self.fusion_gate(
-            mixed_wavs, tse_wavs, speaker_embedding
+            mixed_wavs, tse_wavs, speaker_embedding, mixed_lengths
         )
 
         # ==========================================================
@@ -672,6 +716,7 @@ class JointTSEASR(nn.Module):
             speaker_embedding,
             mixed_wavs=mixed_wavs,
             extracted_wavs=tse_wavs,
+            lengths=mixed_lengths,
         )  # [B, 2]
 
         # ==========================================================
